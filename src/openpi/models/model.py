@@ -243,7 +243,33 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+        state_dict = safetensors.torch.load_file(weight_path)
+        incompatible = model.load_state_dict(state_dict, strict=False)
+
+        if incompatible.missing_keys:
+            raise RuntimeError(
+                "Missing keys when loading PyTorch checkpoint: "
+                + ", ".join(sorted(incompatible.missing_keys))
+            )
+
+        unexpected_keys = sorted(incompatible.unexpected_keys)
+        ignored_prefixes = ("value_head.",)
+        unexpected_not_ignored = [k for k in unexpected_keys if not k.startswith(ignored_prefixes)]
+
+        if unexpected_not_ignored:
+            raise RuntimeError(
+                "Unexpected keys when loading PyTorch checkpoint: "
+                + ", ".join(unexpected_not_ignored)
+            )
+
+        ignored_keys = [k for k in unexpected_keys if k.startswith(ignored_prefixes)]
+        if ignored_keys:
+            logger.warning(
+                "Ignoring %d unexpected checkpoint keys with prefixes %s. Example keys: %s",
+                len(ignored_keys),
+                ignored_prefixes,
+                ", ".join(ignored_keys[:4]),
+            )
         return model
 
     @abc.abstractmethod

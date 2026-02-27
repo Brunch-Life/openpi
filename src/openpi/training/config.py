@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.franka_policy as franka_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -356,6 +357,78 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class CustomDataConfig(DataConfigFactory):
+    """
+    Custom data config for user datasets following Franka EE conventions.
+    Mirrors RLinf's CustomDataConfig so norm-stats and training transforms are consistent.
+    """
+
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    # Finally we will use delta actions to train, but we can input abs_action(get delta for
+    # training via abs_action-state) or delta_action(no other process).
+    extra_delta_transform: bool = True
+    # Train actions using rotation_6d.
+    action_train_with_rotation_6d: bool = False
+
+    @staticmethod
+    def generate_observations(image, state, prompt) -> dict:
+        """Creates an input example for the Franka policy."""
+        return {
+            "observation/image": image,
+            "observation/state": state,
+            "prompt": prompt,
+        }
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                franka_policy.FrankaEEInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    action_train_with_rotation_6d=self.action_train_with_rotation_6d,
+                )
+            ],
+            outputs=[
+                franka_policy.FrankaEEOutputs(
+                    action_train_with_rotation_6d=self.action_train_with_rotation_6d
+                )
+            ],
+        )
+
+        if not self.extra_delta_transform:  # for abs_action
+            # [x, y, z, rotation_6d, gripper] => 10 dims, keep gripper absolute.
+            delta_action_mask = _transforms.make_bool_mask(9, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -648,6 +721,18 @@ _CONFIGS = [
     # are using, and other hyperparameters like how many training steps to run or what learning rate to use.
     # For your own dataset, you can copy this class and modify the dataset name, and data transforms based on
     # the comments below.
+    TrainConfig(
+        name="pi0_custom",
+        model=pi0_config.Pi0Config(),
+        data=CustomDataConfig(
+            repo_id="physical-intelligence/custom_dataset",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(assets_dir="checkpoints/torch/pi0_base/assets"),
+            extra_delta_transform=True,
+            action_train_with_rotation_6d=False,
+        ),
+        pytorch_weight_path="checkpoints/torch/pi0_base",
+    ),
     TrainConfig(
         # Change the name to reflect your model and dataset.
         name="pi0_libero",
