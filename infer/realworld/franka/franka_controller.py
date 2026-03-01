@@ -138,6 +138,21 @@ class FrankaController:
     def _wait_robot(self, sleep_time: int = 1):
         time.sleep(sleep_time)
 
+    def _terminate_process(self, proc: psutil.Process | None, timeout: float = 2.0):
+        if proc is None:
+            return
+        try:
+            if proc.is_running():
+                proc.terminate()
+                proc.wait(timeout=timeout)
+        except psutil.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            pass
+
     def _wait_for_joint(self, target_pos: list[float], timeout: int = 30):
         wait_time = 0.01
         waited_time = 0
@@ -196,7 +211,7 @@ class FrankaController:
 
     def stop_impedance(self):
         if self._impedance:
-            self._impedance.terminate()
+            self._terminate_process(self._impedance)
             self._impedance = None
             self._wait_robot()
         self._logger.debug("Stop Impedance controller")
@@ -234,10 +249,22 @@ class FrankaController:
 
         self._wait_for_joint(reset_pos)
 
-        self._joint.terminate()
+        self._terminate_process(self._joint)
+        self._joint = None
         self._wait_robot()
         self.clear_errors()
         self.start_impedance()
+        return _ImmediateResult(None)
+
+    def shutdown(self):
+        self._terminate_process(self._joint)
+        self._joint = None
+        self._terminate_process(self._impedance)
+        self._impedance = None
+        try:
+            self._ros.shutdown("Franka controller shutdown")
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("Failed to shutdown ROS cleanly: %s", exc)
         return _ImmediateResult(None)
 
     def move_arm(self, position: np.ndarray):
@@ -290,4 +317,3 @@ class FrankaController:
         self._state.gripper_open = False
         self._logger.debug("Close gripper")
         return _ImmediateResult(None)
-

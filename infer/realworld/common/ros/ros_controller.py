@@ -40,6 +40,7 @@ class ROSController:
         if self._ros_version == 1:
             with self._ros_lock:
                 self._ros_core = None
+                self._owns_ros_core = False
                 for proc in psutil.process_iter():
                     if proc.name() == "roscore":
                         self._ros_core = proc
@@ -49,6 +50,7 @@ class ROSController:
                     self._ros_core = psutil.Popen(
                         ["roscore"], stdout=sys.stdout, stderr=sys.stdout
                     )
+                    self._owns_ros_core = True
                     time.sleep(1)
 
         rospy.init_node("franka_controller", anonymous=True)
@@ -91,3 +93,38 @@ class ROSController:
         else:
             self._logger.warning("ROS channel '%s' is not created.", name)
 
+    def shutdown(self, reason: str = "Controller shutdown", timeout: float = 2.0):
+        for channel in self._input_channels.values():
+            try:
+                channel.unregister()
+            except Exception:  # noqa: BLE001
+                pass
+        self._input_channels.clear()
+
+        for channel in self._output_channels.values():
+            try:
+                channel.unregister()
+            except Exception:  # noqa: BLE001
+                pass
+        self._output_channels.clear()
+
+        if not rospy.is_shutdown():
+            try:
+                rospy.signal_shutdown(reason)
+            except Exception:  # noqa: BLE001
+                pass
+
+        if self._owns_ros_core and self._ros_core:
+            try:
+                if self._ros_core.is_running():
+                    self._ros_core.terminate()
+                    self._ros_core.wait(timeout=timeout)
+            except psutil.TimeoutExpired:
+                try:
+                    self._ros_core.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                self._ros_core = None

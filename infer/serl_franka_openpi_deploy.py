@@ -9,6 +9,7 @@ Conventions in this script:
 from __future__ import annotations
 
 import argparse
+import signal
 import time
 from pathlib import Path
 
@@ -139,6 +140,23 @@ def _execute_relative_action(
         _wait_one(controller.close_gripper())
 
 
+def _cleanup(camera, controller) -> None:
+    if camera is not None:
+        try:
+            camera.close()
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: camera close failed: {exc}")
+
+    if controller is not None:
+        try:
+            if hasattr(controller, "shutdown"):
+                _wait_one(controller.shutdown())
+            elif hasattr(controller, "stop_impedance"):
+                _wait_one(controller.stop_impedance())
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: controller shutdown failed: {exc}")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -147,22 +165,42 @@ def main() -> None:
 
     print("Launching Franka controller...")
     controller = FrankaController.launch_controller(robot_ip=args.robot_ip)
+    camera = None
+    stop_requested = False
+    signal_count = 0
 
-    print("Waiting for robot to become ready...")
-    while not bool(_wait_one(controller.is_robot_up())):
-        time.sleep(0.5)
+    def _request_stop(signum, _frame):  # noqa: ANN001
+        nonlocal signal_count, stop_requested
+        signal_count += 1
+        stop_requested = True
+        signal_name = signal.Signals(signum).name
+        if signal_count == 1:
+            print(f"Received {signal_name}. Stopping...")
+        else:
+            print(f"Received {signal_name} again. Forcing exit.")
+            raise SystemExit(130)
 
-    camera = Camera(CameraInfo(name="wrist_1", serial_number=args.camera_serial))
-    camera.open()
-    print("Camera opened. Starting control loop. Press Ctrl+C to stop.")
-    print("1111111")
+    prev_sigint = signal.getsignal(signal.SIGINT)
+    prev_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, _request_stop)
+    signal.signal(signal.SIGTERM, _request_stop)
 
     try:
-        while True:
+        print("Waiting for robot to become ready...")
+        while not stop_requested and not bool(_wait_one(controller.is_robot_up())):
+            time.sleep(0.5)
+
+        if stop_requested:
+            return
+
+        camera = Camera(CameraInfo(name="wrist_1", serial_number=args.camera_serial))
+        camera.open()
+        print("Camera opened. Starting control loop. Press Ctrl+C to stop.")
+
+        while not stop_requested:
             frame_bgr = camera.get_frame(timeout=5)
             image_rgb = _to_rgb(frame_bgr)
             state_abs = _build_absolute_state(controller)
-            print("111111")
 
             obs = {
                 "observation/image": image_rgb,
@@ -175,6 +213,8 @@ def main() -> None:
             print(f"infer -> action_chunk.shape={action_chunk.shape}, execute={planned_actions.shape[0]}")
 
             for action in planned_actions:
+                if stop_requested:
+                    break
                 step_start = time.time()
                 _execute_relative_action(
                     controller,
@@ -189,8 +229,10 @@ def main() -> None:
     except KeyboardInterrupt:
         print("Stopped by user.")
     finally:
-        camera.close()
-        print("Camera closed.")
+        signal.signal(signal.SIGINT, prev_sigint)
+        signal.signal(signal.SIGTERM, prev_sigterm)
+        _cleanup(camera, controller)
+        print("Shutdown complete.")
 
 
 if __name__ == "__main__":

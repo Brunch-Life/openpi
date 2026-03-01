@@ -89,11 +89,22 @@ class Camera:
         self._frame_capturing_start = True
         self._frame_capturing_thread.start()
 
-    def close(self):
+    def close(self, join_timeout: float = 2.0):
         self._frame_capturing_start = False
-        self._frame_capturing_thread.join()
-        self._pipeline.stop()
-        self._config.disable_all_streams()
+
+        # Stop the pipeline first so wait_for_frames() unblocks promptly.
+        try:
+            self._pipeline.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+        if self._frame_capturing_thread.is_alive():
+            self._frame_capturing_thread.join(timeout=join_timeout)
+
+        try:
+            self._config.disable_all_streams()
+        except Exception:  # noqa: BLE001
+            pass
 
     def get_frame(self, timeout: int = 5):
         assert self._frame_capturing_start, (
@@ -104,7 +115,11 @@ class Camera:
     def _capture_frames(self):
         while self._frame_capturing_start:
             time.sleep(1 / self._camera_info.fps)
-            has_frame, frame = self._read_frame()
+            try:
+                has_frame, frame = self._read_frame()
+            except Exception:  # noqa: BLE001
+                # Pipeline may be stopping or device may have become unavailable.
+                break
             if not has_frame:
                 break
             if not self._frame_queue.empty():
@@ -128,4 +143,3 @@ class Camera:
                 return True, np.concatenate((frame, depth), axis=-1)
             return True, frame
         return False, None
-
