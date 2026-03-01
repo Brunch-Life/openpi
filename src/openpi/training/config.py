@@ -727,7 +727,8 @@ _CONFIGS = [
         data=CustomDataConfig(
             repo_id="physical-intelligence/custom_dataset",
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(assets_dir="checkpoints/torch/pi0_base/assets"),
+            # Use per-config assets (`assets/pi0_custom/...`) so computed norm stats are
+            # discovered by `scripts/train.py` without extra copy steps.
             extra_delta_transform=True,
             action_train_with_rotation_6d=False,
         ),
