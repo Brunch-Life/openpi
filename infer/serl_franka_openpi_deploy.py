@@ -9,6 +9,7 @@ Conventions in this script:
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import time
 from pathlib import Path
@@ -51,6 +52,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--device", type=str, default="cuda", help="PyTorch device for inference (cuda/cpu/cuda:0)")
+    parser.add_argument(
+        "--torch-compile-mode",
+        type=str,
+        default="none",
+        help=(
+            "Torch compile mode for PI0 sampling. "
+            "Use none/off to disable compile; valid compile modes include "
+            "default/reduce-overhead/max-autotune."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print actions but do not move robot/gripper")
     return parser.parse_args()
 
@@ -159,6 +170,7 @@ def _cleanup(camera, controller) -> None:
 
 def main() -> None:
     args = parse_args()
+    os.environ["OPENPI_TORCH_COMPILE_MODE"] = args.torch_compile_mode
 
     Camera, CameraInfo, FrankaController = _import_realworld_interfaces()
     policy = _load_policy(args.checkpoint_dir, args.config_name, args.norm_stats_dir, args.device)
@@ -176,6 +188,7 @@ def main() -> None:
         signal_name = signal.Signals(signum).name
         if signal_count == 1:
             print(f"Received {signal_name}. Stopping...")
+            raise KeyboardInterrupt
         else:
             print(f"Received {signal_name} again. Forcing exit.")
             raise SystemExit(130)
@@ -229,10 +242,12 @@ def main() -> None:
     except KeyboardInterrupt:
         print("Stopped by user.")
     finally:
-        signal.signal(signal.SIGINT, prev_sigint)
-        signal.signal(signal.SIGTERM, prev_sigterm)
-        _cleanup(camera, controller)
-        print("Shutdown complete.")
+        try:
+            _cleanup(camera, controller)
+            print("Shutdown complete.")
+        finally:
+            signal.signal(signal.SIGINT, prev_sigint)
+            signal.signal(signal.SIGTERM, prev_sigterm)
 
 
 if __name__ == "__main__":

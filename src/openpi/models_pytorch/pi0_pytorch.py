@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -109,7 +110,19 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        compile_mode = os.getenv("OPENPI_TORCH_COMPILE_MODE", "max-autotune").strip().lower()
+        if compile_mode not in {"", "none", "off", "disable", "disabled", "0", "false"}:
+            try:
+                self.sample_actions = torch.compile(self.sample_actions, mode=compile_mode)
+                logging.info("Enabled torch.compile for sample_actions with mode=%s", compile_mode)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning(
+                    "Failed to enable torch.compile(mode=%s); fallback to eager mode: %s",
+                    compile_mode,
+                    exc,
+                )
+        else:
+            logging.info("torch.compile disabled for sample_actions (OPENPI_TORCH_COMPILE_MODE=%s)", compile_mode)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
