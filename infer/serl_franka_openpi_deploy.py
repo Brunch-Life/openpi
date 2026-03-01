@@ -155,12 +155,14 @@ def main() -> None:
     camera = Camera(CameraInfo(name="wrist_1", serial_number=args.camera_serial))
     camera.open()
     print("Camera opened. Starting control loop. Press Ctrl+C to stop.")
+    print("1111111")
 
     try:
         while True:
             frame_bgr = camera.get_frame(timeout=5)
             image_rgb = _to_rgb(frame_bgr)
             state_abs = _build_absolute_state(controller)
+            print("111111")
 
             obs = {
                 "observation/image": image_rgb,
