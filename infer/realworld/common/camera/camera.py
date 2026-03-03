@@ -45,9 +45,17 @@ class Camera:
         self._device_info = {}
         for device in rs.context().devices:
             self._device_info[device.get_info(rs.camera_info.serial_number)] = device
-        assert camera_info.serial_number in self._device_info, (
-            f"{self._device_info.keys()=}"
-        )
+        available_serials = sorted(self._device_info.keys())
+        if not available_serials:
+            raise RuntimeError(
+                "No Intel RealSense camera detected. "
+                "Check USB connection/power/permissions and run `rs-enumerate-devices`."
+            )
+        if camera_info.serial_number not in self._device_info:
+            raise RuntimeError(
+                "Requested RealSense serial not found. "
+                f"requested={camera_info.serial_number}, available={available_serials}"
+            )
 
         self._serial_number = camera_info.serial_number
         self._device = self._device_info[self._serial_number]
@@ -80,6 +88,7 @@ class Camera:
             target=self._capture_frames, daemon=True
         )
         self._frame_capturing_start = False
+        self._last_capture_error: str | None = None
 
     @property
     def name(self):
@@ -106,22 +115,40 @@ class Camera:
         except Exception:  # noqa: BLE001
             pass
 
-    def get_frame(self, timeout: int = 5):
+    def get_frame(self, timeout: float = 5.0):
         assert self._frame_capturing_start, (
             "Frame capturing is not started. Cannot get frame."
         )
-        return self._frame_queue.get(timeout=timeout)
+        try:
+            return self._frame_queue.get(timeout=timeout)
+        except queue.Empty as exc:
+            raise RuntimeError(
+                f"Timed out after {timeout}s waiting for camera frame "
+                f"(thread_alive={self._frame_capturing_thread.is_alive()}, "
+                f"last_error={self._last_capture_error})"
+            ) from exc
 
     def _capture_frames(self):
+        consecutive_failures = 0
+        max_failures = max(5, self._camera_info.fps)
         while self._frame_capturing_start:
             time.sleep(1 / self._camera_info.fps)
             try:
                 has_frame, frame = self._read_frame()
-            except Exception:  # noqa: BLE001
-                # Pipeline may be stopping or device may have become unavailable.
-                break
+            except Exception as exc:  # noqa: BLE001
+                # Temporary read failures can happen due USB jitter.
+                self._last_capture_error = f"{type(exc).__name__}: {exc}"
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    break
+                continue
             if not has_frame:
-                break
+                self._last_capture_error = "Received an invalid/non-video frame from camera."
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    break
+                continue
+            consecutive_failures = 0
             if not self._frame_queue.empty():
                 try:
                     self._frame_queue.get_nowait()
@@ -143,3 +170,22 @@ class Camera:
                 return True, np.concatenate((frame, depth), axis=-1)
             return True, frame
         return False, None
+
+    @staticmethod
+    def list_connected_devices() -> list[dict[str, str]]:
+        import pyrealsense2 as rs
+
+        devices = []
+        for device in rs.context().devices:
+            serial_number = "unknown"
+            name = "unknown"
+            if device.supports(rs.camera_info.serial_number):
+                serial_number = device.get_info(rs.camera_info.serial_number)
+            if device.supports(rs.camera_info.name):
+                name = device.get_info(rs.camera_info.name)
+            devices.append({"name": name, "serial_number": serial_number})
+        return devices
+
+    @property
+    def last_capture_error(self) -> str | None:
+        return self._last_capture_error

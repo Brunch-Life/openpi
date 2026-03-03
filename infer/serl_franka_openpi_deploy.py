@@ -46,6 +46,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-name", type=str, default="pi0_custom", help="OpenPI config name")
     parser.add_argument("--robot-ip", type=str, required=True, help="Franka robot IP")
     parser.add_argument("--camera-serial", type=str, default="141722078696", help="RealSense D435i serial number")
+    parser.add_argument(
+        "--camera-init-retries",
+        type=int,
+        default=15,
+        help="Number of attempts to initialize the camera before aborting",
+    )
+    parser.add_argument(
+        "--camera-init-retry-delay",
+        type=float,
+        default=1.0,
+        help="Seconds to wait between camera initialization attempts",
+    )
+    parser.add_argument(
+        "--camera-frame-timeout",
+        type=float,
+        default=5.0,
+        help="Seconds to wait for a frame before triggering camera recovery",
+    )
     parser.add_argument("--prompt", type=str, default="perform the manipulation task", help="Language prompt")
     parser.add_argument("--open-loop-steps", type=int, default=4, help="Execute first N actions per replan")
     parser.add_argument("--control-hz", type=float, default=10.0, help="Action execution frequency")
@@ -194,6 +212,49 @@ def _cleanup(camera, controller) -> None:
             print(f"Warning: controller shutdown failed: {exc}")
 
 
+def _open_camera_with_retry(
+    Camera,
+    CameraInfo,
+    *,
+    serial_number: str,
+    retries: int,
+    retry_delay: float,
+):
+    attempts = max(1, retries)
+    delay_s = max(0.0, retry_delay)
+    last_exc: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            camera = Camera(CameraInfo(name="wrist_1", serial_number=serial_number))
+            camera.open()
+            if attempt > 1:
+                print(f"Camera opened on retry {attempt}/{attempts}.")
+            return camera
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            print(f"Camera init failed ({attempt}/{attempts}): {exc}")
+            if hasattr(Camera, "list_connected_devices"):
+                try:
+                    devices = Camera.list_connected_devices()
+                    if devices:
+                        formatted_devices = ", ".join(
+                            f"{d.get('serial_number', 'unknown')} ({d.get('name', 'unknown')})" for d in devices
+                        )
+                    else:
+                        formatted_devices = "none"
+                    print(f"Detected RealSense devices: {formatted_devices}")
+                except Exception as list_exc:  # noqa: BLE001
+                    print(f"Warning: failed to enumerate RealSense devices: {list_exc}")
+
+            if attempt < attempts:
+                time.sleep(delay_s)
+
+    raise RuntimeError(
+        f"Unable to initialize RealSense camera serial={serial_number} after {attempts} attempt(s)."
+    ) from last_exc
+
+
 def _reset_to_initial_joint(
     controller,
     joint_position: Sequence[float],
@@ -294,8 +355,13 @@ def main() -> None:
         if stop_requested:
             return
 
-        camera = Camera(CameraInfo(name="wrist_1", serial_number=args.camera_serial))
-        camera.open()
+        camera = _open_camera_with_retry(
+            Camera,
+            CameraInfo,
+            serial_number=args.camera_serial,
+            retries=args.camera_init_retries,
+            retry_delay=args.camera_init_retry_delay,
+        )
         print("Camera opened.")
         print("Moving robot to initial joint position...")
         _reset_to_initial_joint(
@@ -356,7 +422,24 @@ def main() -> None:
                     time.sleep(0.05)
                     continue
 
-            frame_bgr = camera.get_frame(timeout=5)
+            try:
+                frame_bgr = camera.get_frame(timeout=args.camera_frame_timeout)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Warning: failed to read camera frame: {exc}")
+                try:
+                    camera.close()
+                except Exception as close_exc:  # noqa: BLE001
+                    print(f"Warning: camera close during recovery failed: {close_exc}")
+                camera = _open_camera_with_retry(
+                    Camera,
+                    CameraInfo,
+                    serial_number=args.camera_serial,
+                    retries=args.camera_init_retries,
+                    retry_delay=args.camera_init_retry_delay,
+                )
+                print("Camera recovered. Waiting for next control cycle...")
+                time.sleep(0.05)
+                continue
             image_rgb = _to_rgb(frame_bgr)
             state_abs = _build_absolute_state(controller)
 
