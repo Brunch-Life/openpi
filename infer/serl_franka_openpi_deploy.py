@@ -29,14 +29,13 @@ from openpi.training import config as train_config
 
 
 AUTO_NORM_STATS_RELATIVE_DIR = Path("assets/YinuoTHU/franka_real_gello")
-DEFAULT_INITIAL_JOINT_POSITION = [
-    0.0,
-    -0.78539816339,
-    0.0,
-    -2.35619449019,
-    0.0,
-    1.57079632679,
-    0.78539816339,
+DEFAULT_INITIAL_RESET_POSITION = [
+    6.38755918e-01,
+    -4.83304299e-02,
+    4.42080677e-01,
+    3.09458065e00,
+    -1.41108542e-03,
+    -6.17060595e-02,
 ]
 
 
@@ -99,12 +98,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--initial-joint-position",
         type=float,
-        nargs=7,
-        default=DEFAULT_INITIAL_JOINT_POSITION,
-        metavar=("J1", "J2", "J3", "J4", "J5", "J6", "J7"),
+        nargs="+",
+        default=DEFAULT_INITIAL_RESET_POSITION,
+        metavar="V",
         help=(
-            "Initial Franka 7-DoF joint position used at startup and when pressing 'a' "
-            "(immediate key press in interactive TTY)."
+            "Initial reset target used at startup and when pressing 'a'. "
+            "Accepts either 7 joint values [j1..j7] or 6 absolute TCP values [x,y,z,rx,ry,rz]."
         ),
     )
     return parser.parse_args()
@@ -255,21 +254,36 @@ def _open_camera_with_retry(
     ) from last_exc
 
 
-def _reset_to_initial_joint(
+def _reset_to_initial_position(
     controller,
-    joint_position: Sequence[float],
+    position: Sequence[float],
     *,
     dry_run: bool,
 ) -> None:
-    target_joint = np.asarray(joint_position, dtype=np.float32).reshape(-1)
-    if target_joint.shape != (7,):
-        raise ValueError(f"Expected 7D initial joint position, got {target_joint.shape}")
+    target = np.asarray(position, dtype=np.float32).reshape(-1)
 
-    if dry_run:
-        print(f"[DRY RUN] reset_joint -> {target_joint.tolist()}")
+    if target.shape == (7,):
+        if dry_run:
+            print(f"[DRY RUN] reset_joint -> {target.tolist()}")
+            return
+        _wait_one(controller.reset_joint(target.tolist()))
         return
 
-    _wait_one(controller.reset_joint(target_joint.tolist()))
+    if target.shape == (6,):
+        target_quat = R.from_euler("xyz", target[3:6]).as_quat().astype(np.float32)
+        target_pose = np.concatenate([target[:3], target_quat], axis=0).astype(np.float32)
+        if dry_run:
+            print(f"[DRY RUN] reset_pose_xyzrpy -> {target.tolist()}")
+            print(f"[DRY RUN] reset_pose_xyzw -> {target_pose.tolist()}")
+            return
+        _wait_one(controller.move_arm(target_pose))
+        # Give controller a short settle window after issuing a large absolute move.
+        time.sleep(1.0)
+        return
+
+    raise ValueError(
+        f"Expected initial position to be 6D [x,y,z,rx,ry,rz] or 7D joint values, got {target.shape}"
+    )
 
 
 def _keyboard_command_worker(
@@ -363,8 +377,8 @@ def main() -> None:
             retry_delay=args.camera_init_retry_delay,
         )
         print("Camera opened.")
-        print("Moving robot to initial joint position...")
-        _reset_to_initial_joint(
+        print("Moving robot to initial position...")
+        _reset_to_initial_position(
             controller,
             args.initial_joint_position,
             dry_run=args.dry_run,
@@ -390,7 +404,7 @@ def main() -> None:
             keyboard_thread.start()
 
             print("Interactive commands enabled (no Enter needed):")
-            print("  - Press 'a' to reset to initial joint position")
+            print("  - Press 'a' to reset to initial position")
             print("  - Press 'c' to start/continue policy execution")
             print("  - Press 'q' to quit")
             print("Waiting for 'c' to start execution...")
@@ -409,8 +423,8 @@ def main() -> None:
 
                 if reset_event.is_set():
                     reset_event.clear()
-                    print("Reset command received. Moving to initial joint position...")
-                    _reset_to_initial_joint(
+                    print("Reset command received. Moving to initial position...")
+                    _reset_to_initial_position(
                         controller,
                         args.initial_joint_position,
                         dry_run=args.dry_run,
@@ -467,7 +481,7 @@ def main() -> None:
                     if reset_event.is_set():
                         reset_event.clear()
                         print("Reset command received during execution.")
-                        _reset_to_initial_joint(
+                        _reset_to_initial_position(
                             controller,
                             args.initial_joint_position,
                             dry_run=args.dry_run,
