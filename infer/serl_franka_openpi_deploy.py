@@ -66,8 +66,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", type=str, default="perform the manipulation task", help="Language prompt")
     parser.add_argument("--open-loop-steps", type=int, default=4, help="Execute first N actions per replan")
     parser.add_argument("--control-hz", type=float, default=10.0, help="Action execution frequency")
-    parser.add_argument("--show-camera", action="store_true", help="Show realtime camera image with OpenCV")
-    parser.add_argument("--camera-window-name", type=str, default="OpenPI Camera", help="OpenCV camera window title")
     parser.add_argument("--pos-scale", type=float, default=1.0, help="Scale for dx,dy,dz")
     parser.add_argument("--rot-scale", type=float, default=1.0, help="Scale for drx,dry,drz")
     parser.add_argument(
@@ -331,17 +329,6 @@ def main() -> None:
     args = parse_args()
     os.environ["OPENPI_TORCH_COMPILE_MODE"] = args.torch_compile_mode
 
-    cv2 = None
-    if args.show_camera:
-        try:
-            import cv2 as _cv2
-
-            cv2 = _cv2
-            cv2.namedWindow(args.camera_window_name, cv2.WINDOW_NORMAL)
-        except Exception as exc:  # noqa: BLE001
-            print(f"Warning: failed to initialize camera display, disabling --show-camera: {exc}")
-            cv2 = None
-
     Camera, CameraInfo, FrankaController = _import_realworld_interfaces()
     policy = _load_policy(args.checkpoint_dir, args.config_name, args.norm_stats_dir, args.device)
 
@@ -467,13 +454,6 @@ def main() -> None:
                 print("Camera recovered. Waiting for next control cycle...")
                 time.sleep(0.05)
                 continue
-            if cv2 is not None:
-                cv2.imshow(args.camera_window_name, frame_bgr)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    print("Quit command received from camera window.")
-                    stop_requested = True
-                    break
             image_rgb = _to_rgb(frame_bgr)
             state_abs = _build_absolute_state(controller)
 
@@ -528,11 +508,6 @@ def main() -> None:
                 keyboard_stop_event.set()
             if keyboard_thread is not None:
                 keyboard_thread.join(timeout=1.0)
-            if cv2 is not None:
-                try:
-                    cv2.destroyAllWindows()
-                except Exception as exc:  # noqa: BLE001
-                    print(f"Warning: failed to close camera display window: {exc}")
             _cleanup(camera, controller)
             print("Shutdown complete.")
         finally:
