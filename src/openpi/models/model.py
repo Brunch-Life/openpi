@@ -243,16 +243,18 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        state_dict = safetensors.torch.load_file(weight_path)
-        incompatible = model.load_state_dict(state_dict, strict=False)
+        # Use safetensors load_model so shared/tied weights are handled correctly.
+        # This avoids false "missing key" errors for alias tensors that are not
+        # materialized as separate entries in the checkpoint.
+        missing_keys, unexpected_keys = safetensors.torch.load_model(model, weight_path, strict=False)
 
-        if incompatible.missing_keys:
+        if missing_keys:
             raise RuntimeError(
                 "Missing keys when loading PyTorch checkpoint: "
-                + ", ".join(sorted(incompatible.missing_keys))
+                + ", ".join(sorted(missing_keys))
             )
 
-        unexpected_keys = sorted(incompatible.unexpected_keys)
+        unexpected_keys = sorted(unexpected_keys)
         ignored_prefixes = ("value_head.",)
         unexpected_not_ignored = [k for k in unexpected_keys if not k.startswith(ignored_prefixes)]
 
