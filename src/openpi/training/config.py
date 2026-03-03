@@ -725,14 +725,15 @@ _CONFIGS = [
         name="pi0_custom",
         model=pi0_config.Pi0Config(),
         data=CustomDataConfig(
-            repo_id="physical-intelligence/custom_dataset",
+            repo_id="YinuoTHU/franka_real_gello",
             base_config=DataConfig(prompt_from_task=True),
             # Use per-config assets (`assets/pi0_custom/...`) so computed norm stats are
             # discovered by `scripts/train.py` without extra copy steps.
             extra_delta_transform=True,
             action_train_with_rotation_6d=False,
         ),
-        pytorch_weight_path="checkpoints/torch/pi0_base",
+        pytorch_weight_path="/home/i-chenyn/data/RLinf/checkpoints/torch/pi0_base",
+        batch_size=128
     ),
     TrainConfig(
         # Change the name to reflect your model and dataset.

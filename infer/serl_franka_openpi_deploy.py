@@ -10,9 +10,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import select
 import signal
+import sys
+import termios
+import threading
 import time
+import tty
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -22,7 +28,16 @@ from openpi.shared import normalize as normalize_utils
 from openpi.training import config as train_config
 
 
-AUTO_NORM_STATS_RELATIVE_DIR = Path("physical-intelligence/custom_dataset")
+AUTO_NORM_STATS_RELATIVE_DIR = Path("assets/YinuoTHU/franka_real_gello")
+DEFAULT_INITIAL_JOINT_POSITION = [
+    0.0,
+    -0.78539816339,
+    0.0,
+    -2.35619449019,
+    0.0,
+    1.57079632679,
+    0.78539816339,
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", type=Path, required=True, help="Checkpoint directory containing model.safetensors")
     parser.add_argument("--config-name", type=str, default="pi0_custom", help="OpenPI config name")
     parser.add_argument("--robot-ip", type=str, required=True, help="Franka robot IP")
-    parser.add_argument("--camera-serial", type=str, required=True, help="RealSense D435i serial number")
+    parser.add_argument("--camera-serial", type=str, default="141722078696", help="RealSense D435i serial number")
     parser.add_argument("--prompt", type=str, default="perform the manipulation task", help="Language prompt")
     parser.add_argument("--open-loop-steps", type=int, default=4, help="Execute first N actions per replan")
     parser.add_argument("--control-hz", type=float, default=10.0, help="Action execution frequency")
@@ -63,6 +78,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print actions but do not move robot/gripper")
+    parser.add_argument(
+        "--initial-joint-position",
+        type=float,
+        nargs=7,
+        default=DEFAULT_INITIAL_JOINT_POSITION,
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6", "J7"),
+        help=(
+            "Initial Franka 7-DoF joint position used at startup and when pressing 'a' "
+            "(immediate key press in interactive TTY)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -168,6 +194,62 @@ def _cleanup(camera, controller) -> None:
             print(f"Warning: controller shutdown failed: {exc}")
 
 
+def _reset_to_initial_joint(
+    controller,
+    joint_position: Sequence[float],
+    *,
+    dry_run: bool,
+) -> None:
+    target_joint = np.asarray(joint_position, dtype=np.float32).reshape(-1)
+    if target_joint.shape != (7,):
+        raise ValueError(f"Expected 7D initial joint position, got {target_joint.shape}")
+
+    if dry_run:
+        print(f"[DRY RUN] reset_joint -> {target_joint.tolist()}")
+        return
+
+    _wait_one(controller.reset_joint(target_joint.tolist()))
+
+
+def _keyboard_command_worker(
+    *,
+    stop_event: threading.Event,
+    execution_event: threading.Event,
+    reset_event: threading.Event,
+    quit_event: threading.Event,
+) -> None:
+    if not sys.stdin.isatty():
+        return
+
+    stdin_fd = sys.stdin.fileno()
+    original_termios = termios.tcgetattr(stdin_fd)
+    tty.setcbreak(stdin_fd)
+    try:
+        while not stop_event.is_set() and not quit_event.is_set():
+            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not ready:
+                continue
+
+            raw = os.read(stdin_fd, 1)
+            if not raw:
+                continue
+
+            cmd = raw.decode(errors="ignore").lower()
+            if cmd == "a":
+                reset_event.set()
+                execution_event.clear()
+                print("\n[KEY] a -> reset to initial position", flush=True)
+            elif cmd == "c":
+                if not execution_event.is_set():
+                    print("\n[KEY] c -> start/continue execution", flush=True)
+                execution_event.set()
+            elif cmd == "q":
+                quit_event.set()
+                print("\n[KEY] q -> quit", flush=True)
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, original_termios)
+
+
 def main() -> None:
     args = parse_args()
     os.environ["OPENPI_TORCH_COMPILE_MODE"] = args.torch_compile_mode
@@ -180,6 +262,12 @@ def main() -> None:
     camera = None
     stop_requested = False
     signal_count = 0
+    interactive_control = False
+    keyboard_thread: threading.Thread | None = None
+    keyboard_stop_event: threading.Event | None = None
+    execution_event: threading.Event | None = None
+    reset_event: threading.Event | None = None
+    quit_event: threading.Event | None = None
 
     def _request_stop(signum, _frame):  # noqa: ANN001
         nonlocal signal_count, stop_requested
@@ -208,9 +296,66 @@ def main() -> None:
 
         camera = Camera(CameraInfo(name="wrist_1", serial_number=args.camera_serial))
         camera.open()
-        print("Camera opened. Starting control loop. Press Ctrl+C to stop.")
+        print("Camera opened.")
+        print("Moving robot to initial joint position...")
+        _reset_to_initial_joint(
+            controller,
+            args.initial_joint_position,
+            dry_run=args.dry_run,
+        )
+
+        interactive_control = sys.stdin.isatty()
+        if interactive_control:
+            execution_event = threading.Event()
+            reset_event = threading.Event()
+            quit_event = threading.Event()
+            keyboard_stop_event = threading.Event()
+            keyboard_thread = threading.Thread(
+                target=_keyboard_command_worker,
+                kwargs={
+                    "stop_event": keyboard_stop_event,
+                    "execution_event": execution_event,
+                    "reset_event": reset_event,
+                    "quit_event": quit_event,
+                },
+                daemon=True,
+                name="keyboard-command-worker",
+            )
+            keyboard_thread.start()
+
+            print("Interactive commands enabled (no Enter needed):")
+            print("  - Press 'a' to reset to initial joint position")
+            print("  - Press 'c' to start/continue policy execution")
+            print("  - Press 'q' to quit")
+            print("Waiting for 'c' to start execution...")
+        else:
+            print("stdin is not a TTY. Starting control loop immediately.")
 
         while not stop_requested:
+            if interactive_control:
+                assert execution_event is not None
+                assert reset_event is not None
+                assert quit_event is not None
+
+                if quit_event.is_set():
+                    print("Quit command received.")
+                    break
+
+                if reset_event.is_set():
+                    reset_event.clear()
+                    print("Reset command received. Moving to initial joint position...")
+                    _reset_to_initial_joint(
+                        controller,
+                        args.initial_joint_position,
+                        dry_run=args.dry_run,
+                    )
+                    print("Robot reset complete. Press 'c' to start execution.")
+                    continue
+
+                if not execution_event.is_set():
+                    time.sleep(0.05)
+                    continue
+
             frame_bgr = camera.get_frame(timeout=5)
             image_rgb = _to_rgb(frame_bgr)
             state_abs = _build_absolute_state(controller)
@@ -228,6 +373,25 @@ def main() -> None:
             for action in planned_actions:
                 if stop_requested:
                     break
+                if interactive_control:
+                    assert reset_event is not None
+                    assert quit_event is not None
+
+                    if quit_event.is_set():
+                        print("Quit command received.")
+                        stop_requested = True
+                        break
+                    if reset_event.is_set():
+                        reset_event.clear()
+                        print("Reset command received during execution.")
+                        _reset_to_initial_joint(
+                            controller,
+                            args.initial_joint_position,
+                            dry_run=args.dry_run,
+                        )
+                        print("Robot reset complete. Press 'c' to continue.")
+                        break
+
                 step_start = time.time()
                 _execute_relative_action(
                     controller,
@@ -243,6 +407,10 @@ def main() -> None:
         print("Stopped by user.")
     finally:
         try:
+            if keyboard_stop_event is not None:
+                keyboard_stop_event.set()
+            if keyboard_thread is not None:
+                keyboard_thread.join(timeout=1.0)
             _cleanup(camera, controller)
             print("Shutdown complete.")
         finally:

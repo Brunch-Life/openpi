@@ -127,9 +127,9 @@ def main(
 
     first_step = first_nonempty_steps[0]
     obs = first_step["transitions"]["obs"]
-    image_shape = _to_image_uint8(obs["main_images"]).shape
-    state_shape = tuple(_to_state_pos_rpy_gripper7(obs["states"]).shape)
-    action_shape = tuple(_to_numpy(first_step["action"]).shape)
+    image_shape = (3,128,128)
+    state_shape = (7,)
+    action_shape = (7,)
 
     output_path = HF_LEROBOT_HOME / repo_id
     if output_path.exists():
@@ -146,14 +146,7 @@ def main(
             "image": {
                 "dtype": "image",
                 "shape": image_shape,
-                "names": ["height", "width", "channel"],
-            },
-            # This dataset has only one camera, so we duplicate the same view as wrist image
-            # to stay compatible with OpenPI Libero-style data pipeline.
-            "wrist_image": {
-                "dtype": "image",
-                "shape": image_shape,
-                "names": ["height", "width", "channel"],
+                "names": ["channel", "height", "width"],
             },
             "state": {
                 "dtype": "float32",
@@ -179,14 +172,13 @@ def main(
 
         for step in steps:
             obs = step["transitions"]["obs"]
-            image = _to_image_uint8(obs["main_images"])
+            image = obs["main_images"]
             state = _to_state_pos_rpy_gripper7(obs["states"])
             action = np.asarray(_to_numpy(step["action"]), dtype=np.float32)
 
             dataset.add_frame(
                 {
                     "image": image,
-                    "wrist_image": image,
                     "state": state,
                     "actions": action,
                     "task": task,
